@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+/**
+ * @title QUAI Token
+ * @dev ERC-20 Token implementation for QUAI with additional features
+ */
+contract QUAIToken is ERC20, Ownable, ReentrancyGuard {
+    // 代币基本信息
+    string public constant NAME = "QUAI Token";
+    string public constant SYMBOL = "QUAI";
+    uint8 public constant DECIMALS = 18;
+    
+    // 总供应量：10亿枚
+    uint256 public constant MAX_SUPPLY = 1_000_000_000 * 10 ** DECIMALS;
+    
+    // 铸造相关
+    bool public mintingFinished = false;
+    uint256 public constant MINT_CAP = MAX_SUPPLY;
+    
+    // 交易税相关
+    bool public tradingTaxEnabled = true;
+    uint256 public buyTaxRate = 200; // 2% (乘以100)
+    uint256 public sellTaxRate = 300; // 3% (乘以100)
+    address public taxWallet;
+    
+    // 黑名单和白名单
+    mapping(address => bool) private _isBlacklisted;
+    mapping(address => bool) private _isWhitelisted;
+    
+    // 交易限制
+    mapping(address => bool) public tradingEnabled;
+    
+    // 事件
+    event MintFinished();
+    event TradingTaxToggled(bool enabled);
+    event TaxRatesUpdated(uint256 buyTax, uint256 sellTax);
+    event TaxWalletUpdated(address indexed newWallet);
+    event BlacklistUpdated(address indexed account, bool isBlacklisted);
+    event WhitelistUpdated(address indexed account, bool isWhitelisted);
+    event TradingEnabled(address indexed account, bool enabled);
+    event TokensBurnt(uint256 amount);
+
+    constructor(address initialOwner, address _taxWallet) ERC20(NAME, SYMBOL) {
+        require(initialOwner != address(0), "QUAI: zero address");
+        require(_taxWallet != address(0), "QUAI: zero tax wallet");
+        
+        transferOwnership(initialOwner);
+        taxWallet = _taxWallet;
+        
+        // 初始铸造给所有者（可根据需要调整）
+        _mint(initialOwner, 500_000_000 * 10 ** DECIMALS); // 50%初始供应
+    }
+
+    /**
+     * @dev 完成铸造阶段
+     */
+    function finishMinting() external onlyOwner returns (bool) {
+        require(!mintingFinished, "QUAI: minting already finished");
+        mintingFinished = true;
+        emit MintFinished();
+        return true;
+    }
+
+    /**
+     * @dev 铸造代币（仅在未完成铸造时可用）
+     */
+    function mint(address to, uint256 amount) external onlyOwner nonReentrant {
+        require(!mintingFinished, "QUAI: minting finished");
+        require(totalSupply() + amount <= MINT_CAP, "QUAI: cap exceeded");
+        
+        _mint(to, amount);
+    }
+
+    /**
+     * @dev 销毁代币
+     */
+    function burn(uint256 amount) external nonReentrant {
+        _burn(msg.sender, amount);
+        emit TokensBurnt(amount);
+    }
+
+    /**
+     * @dev 销毁指定地址的代币（仅所有者可用）
+     */
+    function burnFrom(address account, uint256 amount) external onlyOwner nonReentrant {
+        _burn(account, amount);
+        emit TokensBurnt(amount);
+    }
+
+    /**
+     * @dev 重写转账函数以包含交易税逻辑
+     */
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal override {
+        require(!_isBlacklisted[from], "QUAI: sender blacklisted");
+        require(!_isBlacklisted[to], "QUAI: recipient blacklisted");
+        
+        // 检查交易是否启用
+        if (!_isWhitelisted[from] && !_isWhitelisted[to]) {
+            require(tradingEnabled[from], "QUAI: trading not enabled for sender");
+            require(tradingEnabled[to], "QUAI: trading not enabled for recipient");
+        }
+        
+        // 计算和应用交易税
+        uint256 taxAmount = 0;
+        uint256 netAmount = amount;
+        
+        if (tradingTaxEnabled && !_isWhitelisted[from] && !_isWhitelisted[to]) {
+            bool isBuy = _isWhitelisted[from]; // 简化逻辑，实际应根据DEX判断
+            bool isSell = _isWhitelisted[to];   // 简化逻辑，实际应根据DEX判断
+            
+            uint256 taxRate = 0;
+            if (isBuy) {
+                taxRate = buyTaxRate;
+            } else if (isSell) {
+                taxRate = sellTaxRate;
+            }
+            
+            if (taxRate > 0) {
+                taxAmount = (amount * taxRate) / 10000; // 除以10000因为税率乘以了100
+                netAmount = amount - taxAmount;
+                
+                // 将税收发送到税收钱包
+                super._transfer(from, taxWallet, taxAmount);
+            }
+        }
+        
+        // 执行净转账
+        if (netAmount > 0) {
+            super._transfer(from, to, netAmount);
+        }
+    }
+
+    /**
+     * @dev 切换交易税开关
+     */
+    function toggleTradingTax() external onlyOwner {
+        tradingTaxEnabled = !tradingTaxEnabled;
+        emit TradingTaxToggled(tradingTaxEnabled);
+    }
+
+    /**
+     * @dev 更新税率
+     */
+    function updateTaxRates(uint256 newBuyTax, uint256 newSellTax) external onlyOwner {
+        require(newBuyTax <= 1000, "QUAI: buy tax too high"); // 最大10%
+        require(newSellTax <= 1000, "QUAI: sell tax too high"); // 最大10%
+        
+        buyTaxRate = newBuyTax;
+        sellTaxRate = newSellTax;
+        emit TaxRatesUpdated(newBuyTax, newSellTax);
+    }
+
+    /**
+     * @dev 更新税收钱包
+     */
+    function updateTaxWallet(address newWallet) external onlyOwner {
+        require(newWallet != address(0), "QUAI: zero address");
+        taxWallet = newWallet;
+        emit TaxWalletUpdated(newWallet);
+    }
+
+    /**
+     * @dev 添加/移除黑名单
+     */
+    function setBlacklist(address account, bool blacklisted) external onlyOwner {
+        _isBlacklisted[account] = blacklisted;
+        emit BlacklistUpdated(account, blacklisted);
+    }
+
+    /**
+     * @dev 添加/移除白名单
+     */
+    function setWhitelist(address account, bool whitelisted) external onlyOwner {
+        _isWhitelisted[account] = whitelisted;
+        emit WhitelistUpdated(account, whitelisted);
+    }
+
+    /**
+     * @dev 启用/禁用地址的交易功能
+     */
+    function setTradingEnabled(address account, bool enabled) external onlyOwner {
+        tradingEnabled[account] = enabled;
+        emit TradingEnabled(account, enabled);
+    }
+
+    /**
+     * @dev 批量设置交易状态
+     */
+    function batchSetTradingEnabled(address[] calldata accounts, bool enabled) external onlyOwner {
+        for (uint i = 0; i < accounts.length; i++) {
+            tradingEnabled[accounts[i]] = enabled;
+            emit TradingEnabled(accounts[i], enabled);
+        }
+    }
+
+    /**
+     * @dev 获取代币信息
+     */
+    function getTokenInfo() external view returns (
+        string memory name_,
+        string memory symbol_,
+        uint8 decimals_,
+        uint256 totalSupply_,
+        uint256 maxSupply_
+    ) {
+        return (NAME, SYMBOL, DECIMALS, totalSupply(), MAX_SUPPLY);
+    }
+
+    /**
+     * @dev 检查地址是否被拉黑
+     */
+    function isBlacklisted(address account) external view returns (bool) {
+        return _isBlacklisted[account];
+    }
+
+    /**
+     * @dev 检查地址是否在白名单中
+     */
+    function isWhitelisted(address account) external view returns (bool) {
+        return _isWhitelisted[account];
+    }
+
+    /**
+     * @dev 防止意外转账到合约地址
+     */
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal override {
+        super._beforeTokenTransfer(from, to, amount);
+        
+        // 防止转账到零地址
+        require(to != address(0), "QUAI: transfer to zero address");
+        
+        // 如果是合约地址且不是白名单，可以添加额外检查
+        if (to != address(0) && !_isWhitelisted[to]) {
+            // 可以在这里添加对合约地址的检查逻辑
+        }
+    }
+}
